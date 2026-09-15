@@ -154,6 +154,9 @@ function App() {
   // clears redoStack, same as browser back/forward history
   const [undoStack, setUndoStack] = useState([]);
   const [redoStack, setRedoStack] = useState([]);
+  // True once we've received a real board state (board:init / board:join / board:load), so
+  // the auto-save effect never overwrites a saved board with the initial empty shapes array
+  const boardReady = useRef(false);
   const shapeRefs = useRef({});
   const trRef = useRef(null);
   const stageRef = useRef(null);
@@ -238,6 +241,15 @@ function App() {
       setSelectedIds(new Set());
     });
 
+    // Sent once right after a fresh connection lands on the default board — populates
+    // whatever was already drawn there so joining late isn't a blank canvas
+    socket.on("board:init", ({ boardId, shapes: initialShapes }) => {
+      setCurrentBoardId(boardId);
+      setBoardNameInput(boardId);
+      setShapes(dedupeShapes(initialShapes));
+      boardReady.current = true;
+    });
+
     return () => {
       socket.off("connect");
       socket.off("disconnect");
@@ -246,8 +258,21 @@ function App() {
       socket.off("shape:update");
       socket.off("shape:delete");
       socket.off("board:sync");
+      socket.off("board:init");
     };
   }, []);
+
+  // Auto-save: persist the board a moment after any change settles, so newly-joining users
+  // (via board:init/board:join) always find what's already been drawn instead of needing
+  // someone to remember to click Save first. Guarded by boardReady so we don't overwrite
+  // the saved board with an empty array before board:init/board:join has responded.
+  useEffect(() => {
+    if (!boardReady.current) return;
+    const timeout = setTimeout(() => {
+      socket.emit("board:save", shapes, () => {});
+    }, 800);
+    return () => clearTimeout(timeout);
+  }, [shapes]);
 
   // Attach the resize handles, but only when exactly one resizable shape (rect/circle/text)
   // is selected. Multiple shapes, or a line, just get the plain selection highlight instead.

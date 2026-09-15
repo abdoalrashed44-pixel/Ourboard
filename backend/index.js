@@ -47,10 +47,16 @@ io.on("connection", (socket) => {
 
   // A recovered reconnect already has its previous board's room (and socket.data, which
   // holds boardId) restored automatically by Socket.IO's connection state recovery — only
-  // a genuinely fresh connection needs to be placed on the default board
+  // a genuinely fresh connection needs to be placed on the default board and handed its
+  // already-drawn shapes, so joining late doesn't mean landing on a blank canvas
   if (!socket.recovered) {
     socket.data.boardId = DEFAULT_BOARD_ID;
     socket.join(DEFAULT_BOARD_ID);
+    Board.findOne({ boardId: DEFAULT_BOARD_ID })
+      .then((board) => {
+        socket.emit("board:init", { boardId: DEFAULT_BOARD_ID, shapes: board ? board.shapes : [] });
+      })
+      .catch((err) => console.error("board:init lookup failed:", err.message));
   }
 
   // Every shape lifecycle event (create, move/resize, undo-delete) only reaches other
