@@ -1,0 +1,3 @@
+- [Project overview](project_overview.md) — OurBoard TM471 identity and academic framing, defended Dec 2026
+- [Project timeline](project_timeline.md) — TM471 academic Gantt deadlines (TMA1 16/04/2026, TMA2/final 10/12/2026, presentation 11-20/12/2026)
+- [Project requirements](project_requirements.md) — functional/non-functional reqs, use cases, initial class diagram from the report
