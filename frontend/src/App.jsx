@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from 'react';
 import Konva from 'konva';
 import { Stage, Layer, Group, Rect, Ellipse, Line, Text, Circle, Arrow, Shape, Transformer } from 'react-konva';
 import { socket } from './socket';
+import BoardImage from './BoardImage.jsx';
 import './App.css';
 
 // "shapes" isn't a tool itself — it's the dropdown button holding every SHAPE_TOOLS entry.
@@ -26,10 +27,24 @@ const SHAPE_TOOLS = [
   { group: "Use case diagram", type: "usecase", label: "Use case", hint: "Action (oval)" },
   { group: "Use case diagram", type: "boundary", label: "System boundary", hint: "Frame + title" },
   { group: "Use case diagram", type: "dashedArrow", label: "Dashed arrow", hint: "«include» / «extend»" },
+  { group: "Table", type: "table", label: "Table", hint: "Rows × columns" },
 ];
 
-// Shapes drawn by dragging out a box, each a Group of outline + label
-const BOX_TYPES = ["rect", "circle", "pill", "diamond", "parallelogram", "cylinder", "actor", "usecase", "boundary", "sticky"];
+// Shapes drawn by dragging out a box, each a Group of outline + label (a table draws its
+// grid of cells instead of one label)
+const BOX_TYPES = ["rect", "circle", "pill", "diamond", "parallelogram", "cylinder", "actor", "usecase", "boundary", "sticky", "table"];
+
+// A table's text lives in its `cells` field: one list per row, one text per cell. Every
+// column is equally wide and every row equally tall, so the grid is just the table's size
+// divided up — no per-cell sizes to store or keep in sync
+const TABLE_START = { rows: 3, cols: 3 };
+const TABLE_MAX_LINES = 10; // the most rows, and the most columns
+// However small a table is dragged out, each cell gets at least this much room
+const TABLE_MIN_CELL = { width: 60, height: 32 };
+
+function emptyCells(rows, cols) {
+  return Array.from({ length: rows }, () => Array(cols).fill(""));
+}
 
 // Shapes an arrow or line can attach to. A system boundary is left out: it's a frame
 // around other shapes, not something you connect to
@@ -44,6 +59,53 @@ const SHORTCUT_KEYS = { select: "V", hand: "H", line: "M" };
 // Zoom limits: 0.25 = 25%, 4 = 400%. Zoom is per-user and never sent over the socket
 const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 4;
+
+// Pictures travel inside their shape as text (a "data URL"), and auto-save sends the whole
+// board each time — so each picture is shrunk in the browser first, and a board holds only
+// a few. Worst case: 10 × 300 KB = 3 MB per save, inside the server's 8 MB message limit
+const MAX_IMAGE_SIDE = 1000; // pixels, on the picture's longest side
+const MAX_IMAGE_BYTES = 300 * 1024; // a data URL is plain text, so 1 character = 1 byte
+const MAX_IMAGES_PER_BOARD = 10;
+// How big a new picture first appears on the board (it can be resized from there)
+const IMAGE_START_SIZE = 400;
+const RESIZE_ALL_SIDES = ["top-left", "top-center", "top-right", "middle-right", "middle-left", "bottom-left", "bottom-center", "bottom-right"];
+// Pictures resize from the corners only, which keeps their proportions
+const RESIZE_CORNERS = ["top-left", "top-right", "bottom-left", "bottom-right"];
+
+// Reads a picture file and shrinks it: at most MAX_IMAGE_SIDE pixels on its longest side,
+// saved as a JPEG, lowering the quality step by step until it fits MAX_IMAGE_BYTES.
+// Resolves to { src, width, height }, where src is the shrunk picture as a data URL
+function shrinkImage(file) {
+  return new Promise((resolve, reject) => {
+    const fileUrl = URL.createObjectURL(file);
+    const img = new window.Image();
+    img.onload = () => {
+      URL.revokeObjectURL(fileUrl);
+      const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext("2d");
+      // JPEG can't store see-through pixels, so paint them black: the board's own colour
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      for (const quality of [0.8, 0.6, 0.4]) {
+        const src = canvas.toDataURL("image/jpeg", quality);
+        if (src.length <= MAX_IMAGE_BYTES) {
+          resolve({ src, width: canvas.width, height: canvas.height });
+          return;
+        }
+      }
+      reject(new Error("That picture is too detailed — try a smaller one"));
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(fileUrl);
+      reject(new Error("That file isn't a picture the browser can open"));
+    };
+    img.src = fileUrl;
+  });
+}
 
 // Five colors chosen to stay readable against the black canvas background — shared by
 // every tool (rect/circle/line stroke, and text)
@@ -392,6 +454,8 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
   const [explainPanel, setExplainPanel] = useState(null);
   const lineMenuRef = useRef(null);
   const shapesMenuRef = useRef(null);
+  // The hidden file picker behind the Image button
+  const imageInputRef = useRef(null);
   const eraserMenuRef = useRef(null);
   const shapeMenuRef = useRef(null);
   // Tool that was active before the user started holding Ctrl, so releasing it restores it
@@ -523,7 +587,7 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
     }
     const id = [...selectedIds][0];
     const shape = shapes.find((s) => s.id === id);
-    const canResize = shape && (BOX_TYPES.includes(shape.type) || shape.type === "text");
+    const canResize = shape && (BOX_TYPES.includes(shape.type) || shape.type === "text" || shape.type === "image");
     trRef.current.nodes(canResize && shapeRefs.current[id] ? [shapeRefs.current[id]] : []);
     trRef.current.getLayer()?.batchDraw();
   }, [selectedIds, shapes]);
@@ -773,6 +837,66 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
       }
     );
   };
+
+  // Adds a picture from the clipboard or the Image button: shrinks it, then places it in
+  // the middle of the screen as a new shape, selected and ready to move or resize. It goes
+  // through applyDiff + pushUndo like any other new shape, so it syncs and can be undone
+  const addImageFile = async (file) => {
+    if (shapes.filter((s) => s.type === "image").length >= MAX_IMAGES_PER_BOARD) {
+      flashStatus(`A board can hold ${MAX_IMAGES_PER_BOARD} pictures at most`);
+      return;
+    }
+    let picture;
+    try {
+      picture = await shrinkImage(file);
+    } catch (err) {
+      flashStatus(err.message);
+      return;
+    }
+    const fit = Math.min(1, IMAGE_START_SIZE / Math.max(picture.width, picture.height));
+    const width = picture.width * fit;
+    const height = picture.height * fit;
+    // The middle of the screen, in board coordinates (zoom and panning undone)
+    const centreX = (canvasSize.width / 2 - view.x) / view.scale;
+    const centreY = (canvasSize.height / 2 - view.y) / view.scale;
+    const shape = {
+      id: `shape_${crypto.randomUUID()}`,
+      type: "image",
+      x: centreX - width / 2,
+      y: centreY - height / 2,
+      width,
+      height,
+      src: picture.src,
+      stroke: "transparent",
+      fill: "transparent",
+      points: [],
+      text: "",
+      createdBy: userId,
+    };
+    applyDiff([], [shape]);
+    pushUndo([], [shape]);
+    // Pasting ends the hold-Ctrl-to-select shortcut, so letting go of Ctrl afterwards
+    // doesn't switch tools and drop the new picture's selection
+    preSelectTool.current = null;
+    setTool("select");
+    setSelectedIds(new Set([shape.id]));
+  };
+
+  // Ctrl+V with a picture on the clipboard (a screenshot, or "Copy image" in a browser)
+  // puts it on the board. While typing in a text box, paste is left alone to paste text
+  useEffect(() => {
+    const onPaste = (e) => {
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === "TEXTAREA" || tag === "INPUT") return;
+      const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith("image/"));
+      if (!item) return;
+      e.preventDefault();
+      addImageFile(item.getAsFile());
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shapes, view, canvasSize]);
 
   // Ctrl+Z / Cmd+Z to undo, Ctrl+Shift+Z or Ctrl+Y to redo, Delete/Backspace to remove the
   // current selection — none of this while typing in the text box or the AI prompt input
@@ -1081,6 +1205,7 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
         text: tool === "dashedArrow" ? "«include»" : "",
         ...(isArrowTool && { dashed: tool === "dashedArrow" }),
         ...(isHighlighter && { highlight: true }),
+        ...(tool === "table" && { cells: emptyCells(TABLE_START.rows, TABLE_START.cols) }),
         createdBy: userId,
       },
     ]);
@@ -1190,6 +1315,19 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
         drawingShapeId.current = null;
         return;
       }
+    }
+
+    // A table dragged out too small to type in is grown to fit its cells
+    if (finishedShape && finishedShape.type === "table") {
+      const box = getShapeBounds(finishedShape);
+      const grown = {
+        ...finishedShape,
+        ...box,
+        width: Math.max(box.width, TABLE_START.cols * TABLE_MIN_CELL.width),
+        height: Math.max(box.height, TABLE_START.rows * TABLE_MIN_CELL.height),
+      };
+      setShapes((prev) => prev.map((s) => (s.id === grown.id ? grown : s)));
+      finishedShape = grown;
     }
 
     // An arrow started or released on a shape becomes attached to it
@@ -1395,13 +1533,17 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
   };
 
   // Transformer resize reports a scale factor, not a new width/height — apply it to our
-  // stored size (and font size, for text), then reset the node's internal scale back to 1
+  // stored size (and font size, for text), then reset the node's internal scale back to 1.
+  // Turning a shape with the rotate handle is saved too, in degrees. Konva turns a shape
+  // around its top-left corner, so it also moves x/y to make the turn look centred — both
+  // are read back from the node and stored together
   const handleTransformEnd = (shape) => (e) => {
     const node = e.target;
     const scaleX = node.scaleX();
     const scaleY = node.scaleY();
     node.scaleX(1);
     node.scaleY(1);
+    const rotation = node.rotation();
 
     if (shape.type === "text") {
       const avgScale = (scaleX + scaleY) / 2;
@@ -1409,6 +1551,7 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
         ...shape,
         x: node.x(),
         y: node.y(),
+        rotation,
         width: Math.max(20, shape.width * scaleX),
         fontSize: Math.max(8, (shape.fontSize || 18) * avgScale),
       };
@@ -1418,7 +1561,7 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
     }
 
     const box = getShapeBounds(shape);
-    const updated = { ...shape, x: node.x(), y: node.y(), width: box.width * scaleX, height: box.height * scaleY };
+    const updated = { ...shape, x: node.x(), y: node.y(), rotation, width: box.width * scaleX, height: box.height * scaleY };
 
     setShapes((prev) => prev.map((s) => (s.id === shape.id ? updated : s)));
     socket.emit("shape:update", updated);
@@ -1460,10 +1603,80 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
     openLabelEditor(shape);
   };
 
+  // Saves a change to a table — a cell's text, or a row/column added or removed — and
+  // makes it undoable: the undo history stores the table before and after, so undo swaps
+  // the old one back in. Arrows attached to the table follow its new size
+  const commitTableChange = (before, after) => {
+    setShapes((prev) => prev.map((s) => (s.id === after.id ? after : s)));
+    socket.emit("shape:update", after);
+    pushUndo([before], [after]);
+    rerouteConnectors({ [after.id]: getShapeBounds(after) }, shapes, new Set([after.id]), true);
+  };
+
+  // Double-clicking a table opens the text box over just the cell that was clicked: which
+  // row and column that is comes from how far into the table the click landed. The table's
+  // own Group measures that (currentTarget), so it's right even when the table is rotated
+  const handleCellDblClick = (shape) => (e) => {
+    if (tool !== "select") return;
+    const inside = e.currentTarget.getRelativePointerPosition();
+    const box = getShapeBounds(shape);
+    const rows = shape.cells.length;
+    const cols = shape.cells[0].length;
+    const cellWidth = box.width / cols;
+    const cellHeight = box.height / rows;
+    const row = Math.min(rows - 1, Math.max(0, Math.floor(inside.y / cellHeight)));
+    const col = Math.min(cols - 1, Math.max(0, Math.floor(inside.x / cellWidth)));
+    setTextEditor({
+      id: shape.id,
+      isLabel: true,
+      cell: { row, col },
+      x: box.x + col * cellWidth,
+      y: box.y + row * cellHeight,
+      width: Math.max(80, cellWidth),
+      height: Math.max(36, cellHeight),
+      fontSize: shape.fontSize || 16,
+      color: shape.stroke,
+      value: shape.cells[row][col],
+    });
+  };
+
+  // The + / − Row and Column buttons. Rows are added and removed at the bottom, columns at
+  // the right; every cell that stays keeps its text, and cells keep their size, so the
+  // table grows or shrinks by one cell
+  const resizeTable = (table, rowChange, colChange) => {
+    const rows = table.cells.length;
+    const cols = table.cells[0].length;
+    const newRows = rows + rowChange;
+    const newCols = cols + colChange;
+    if (newRows < 1 || newCols < 1 || newRows > TABLE_MAX_LINES || newCols > TABLE_MAX_LINES) return;
+    const box = getShapeBounds(table);
+    const cells = Array.from({ length: newRows }, (_, r) =>
+      Array.from({ length: newCols }, (_, c) => table.cells[r]?.[c] ?? "")
+    );
+    commitTableChange(table, {
+      ...table,
+      ...box,
+      width: (box.width / cols) * newCols,
+      height: (box.height / rows) * newRows,
+      cells,
+    });
+  };
+
   const confirmText = () => {
     if (textEditor?.isLabel) {
       const target = shapes.find((s) => s.id === textEditor.id);
-      if (target) {
+      if (target && textEditor.cell) {
+        const { row, col } = textEditor.cell;
+        const value = textEditor.value.trim();
+        // The cell may be gone if someone else removed its row or column meanwhile
+        const current = target.cells[row]?.[col];
+        if (current !== undefined && current !== value) {
+          const cells = target.cells.map((cellsInRow, r) =>
+            cellsInRow.map((text, c) => (r === row && c === col ? value : text))
+          );
+          commitTableChange(target, { ...target, cells });
+        }
+      } else if (target) {
         const updated = { ...target, text: textEditor.value.trim() }; // empty = remove the label
         setShapes((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
         socket.emit("shape:update", updated);
@@ -1528,6 +1741,14 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
   // The Shapes button counts as the active tool whenever any shape from its menu is chosen,
   // and shows that shape's name
   const activeShape = SHAPE_TOOLS.find((s) => s.type === tool);
+  // A lone selected picture gets corner handles only (see RESIZE_CORNERS)
+  const selectedIsImage =
+    selectedIds.size === 1 && shapes.find((s) => selectedIds.has(s.id))?.type === "image";
+  // A lone selected table gets the + / − Row and Column buttons underneath it
+  const selectedTable =
+    tool === "select" && selectedIds.size === 1
+      ? shapes.find((s) => selectedIds.has(s.id) && s.type === "table")
+      : null;
   const isToolActive = (t) => {
     if (t === "shapes") return Boolean(activeShape);
     if (t === "line") return tool === "line" || tool === "highlighter"; // one button, two pens
@@ -1542,6 +1763,9 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
     const commonProps = {
       key: shape.id,
       ref: (node) => (shapeRefs.current[shape.id] = node),
+      // Degrees, set with the rotate handle; shapes that were never turned have none.
+      // Lines and arrows never get the handle, so theirs is always 0
+      rotation: shape.rotation || 0,
       draggable: selectable,
       onClick: handleSelect(shape.id),
       onTap: handleSelect(shape.id),
@@ -1556,6 +1780,59 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
       shadowBlur: isSelected ? 10 : 0,
       shadowOpacity: isSelected ? 0.8 : 0,
     };
+
+    // A table is a Group too: its outline, a shaded header row, the grid lines and one text
+    // per cell. Only the outline listens for clicks; everything else lets them through
+    if (shape.type === "table") {
+      const box = getShapeBounds(shape);
+      const rows = shape.cells.length;
+      const cols = shape.cells[0].length;
+      const cellWidth = box.width / cols;
+      const cellHeight = box.height / rows;
+      const gridLine = { stroke: shape.stroke, strokeWidth: 1, opacity: 0.6, listening: false };
+      return (
+        <Group
+          {...commonProps}
+          x={box.x}
+          y={box.y}
+          onTransformEnd={handleTransformEnd(shape)}
+          onDblClick={handleCellDblClick(shape)}
+          onDblTap={handleCellDblClick(shape)}
+        >
+          <Rect width={box.width} height={box.height} stroke={shape.stroke} strokeWidth={shape.strokeWidth || 2} {...highlight} />
+          <Rect width={box.width} height={cellHeight} fill={shape.stroke} opacity={0.15} listening={false} />
+          {Array.from({ length: cols - 1 }, (_, i) => (
+            <Line key={`col${i}`} points={[cellWidth * (i + 1), 0, cellWidth * (i + 1), box.height]} {...gridLine} />
+          ))}
+          {Array.from({ length: rows - 1 }, (_, i) => (
+            <Line key={`row${i}`} points={[0, cellHeight * (i + 1), box.width, cellHeight * (i + 1)]} {...gridLine} />
+          ))}
+          {shape.cells.map((cellsInRow, r) =>
+            cellsInRow.map((text, c) =>
+              text ? (
+                <Text
+                  key={`${r}-${c}`}
+                  x={c * cellWidth}
+                  y={r * cellHeight}
+                  width={cellWidth}
+                  height={cellHeight}
+                  text={text}
+                  fill={shape.stroke}
+                  fontSize={shape.fontSize || 16}
+                  fontStyle={r === 0 ? "bold" : "normal"}
+                  verticalAlign="middle"
+                  padding={8}
+                  wrap="word"
+                  // Text too long for its cell ends in "…" instead of spilling out
+                  ellipsis
+                  listening={false}
+                />
+              ) : null
+            )
+          )}
+        </Group>
+      );
+    }
 
     // A box shape is a Group: its outline plus a centred label, so the two always move and
     // resize together. The Group sits at the top-left corner of the shape's box and its
@@ -1672,6 +1949,19 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
             wrap="word"
             onDblClick={handleTextDblClick(shape)}
             onDblTap={handleTextDblClick(shape)}
+            onTransformEnd={handleTransformEnd(shape)}
+          />
+        );
+      case "image":
+        return (
+          <BoardImage
+            {...commonProps}
+            {...highlight}
+            src={shape.src}
+            x={shape.x}
+            y={shape.y}
+            width={shape.width}
+            height={shape.height}
             onTransformEnd={handleTransformEnd(shape)}
           />
         );
@@ -1903,6 +2193,27 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
             )}
           </div>
         ))}
+
+        {/* An action, not a tool: opens the computer's file picker. Ctrl+V does the same
+            with a picture that's already on the clipboard */}
+        <button
+          onClick={() => imageInputRef.current?.click()}
+          title="Add a picture (or paste one with Ctrl+V)"
+          style={{ padding: "6px 10px", border: "1px solid #999", borderRadius: "4px", cursor: "pointer" }}
+        >
+          Image
+        </button>
+        <input
+          ref={imageInputRef}
+          type="file"
+          accept="image/*"
+          style={{ display: "none" }}
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            e.target.value = ""; // so picking the same file again still counts as a change
+            if (file) addImageFile(file);
+          }}
+        />
 
         <button
           onClick={handleUndo}
@@ -2213,6 +2524,7 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
             {shapes.map(renderShape)}
             <Transformer
               ref={trRef}
+              enabledAnchors={selectedIsImage ? RESIZE_CORNERS : RESIZE_ALL_SIDES}
               boundBoxFunc={(oldBox, newBox) => {
                 if (Math.abs(newBox.width) < 5 || Math.abs(newBox.height) < 5) return oldBox;
                 return newBox;
@@ -2266,8 +2578,46 @@ function App({ boardId, initialShapes, userId, onLeaveBoard }) {
               onPickThickness={(thickness) => applyShapeStyle({ thickness })}
             />
             <div style={{ color: "#888", fontSize: "11px", marginTop: "8px", fontFamily: "sans-serif" }}>
-              Tip: double-click it to add a label
+              {shapes.find((s) => s.id === shapeMenu.shapeId)?.type === "table"
+                ? "Tip: double-click a cell to type in it"
+                : "Tip: double-click it to add a label"}
             </div>
+          </div>
+        )}
+
+        {selectedTable && !textEditor && (
+          <div
+            style={{
+              position: "absolute",
+              left: toScreen(getShapeBounds(selectedTable)).x,
+              top: toScreen({ x: 0, y: getShapeBounds(selectedTable).y + getShapeBounds(selectedTable).height }).y + 8,
+              display: "flex",
+              gap: "4px",
+              zIndex: 20,
+            }}
+          >
+            {[
+              { label: "+ Row", rows: 1, cols: 0 },
+              { label: "− Row", rows: -1, cols: 0 },
+              { label: "+ Column", rows: 0, cols: 1 },
+              { label: "− Column", rows: 0, cols: -1 },
+            ].map((b) => (
+              <button
+                key={b.label}
+                onClick={() => resizeTable(selectedTable, b.rows, b.cols)}
+                style={{
+                  padding: "4px 8px",
+                  background: "#111",
+                  color: "#fff",
+                  border: "1px solid #444",
+                  borderRadius: "4px",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                }}
+              >
+                {b.label}
+              </button>
+            ))}
           </div>
         )}
 

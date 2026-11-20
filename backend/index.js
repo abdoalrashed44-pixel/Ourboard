@@ -52,6 +52,11 @@ const io = new Server(server, {
   connectionStateRecovery: {
     maxDisconnectionDuration: 2 * 60 * 1000,
   },
+  // The biggest single message a browser may send. Socket.IO's default is 1 MB, but
+  // pictures travel inside their shapes and auto-save sends the whole board, so a board
+  // with pictures (the browser allows 10 × 300 KB) needs more. Anything bigger than this
+  // is refused and that connection is closed — the hard limit no browser can get around
+  maxHttpBufferSize: 8 * 1024 * 1024,
 });
 
 // Every live connection must carry a valid sign-in ticket (JWT). Without one it's refused
