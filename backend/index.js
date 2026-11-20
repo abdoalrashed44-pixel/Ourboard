@@ -4,15 +4,33 @@ import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
 import Board from './models/Board.js';
+import authRoutes from './routes/auth.js';
+import { readToken } from './services/tokens.js';
 import { generateDiagram, convertSketch, explainSelection } from './services/generateDiagram.js';
 
-// Everyone lands on this shared board by default, same as before board rooms existed —
-// picking a different one is opt-in via board:join
-const DEFAULT_BOARD_ID = 'main';
+// Without this secret nobody could sign in, so stop straight away with a clear message
+// instead of failing in a confusing way later
+if (!process.env.JWT_SECRET) {
+  console.error("JWT_SECRET is missing — add it to backend/.env (or to Render's Environment settings)");
+  process.exit(1);
+}
+
+const MAX_OWNED_BOARDS = 4;
+const MIN_BOARD_PASSWORD_LENGTH = 4;
+const BOARD_HASH_ROUNDS = 10;
+
+// FRONTEND_URL is set in Render's dashboard once the frontend is deployed; localhost stays
+// allowed too so local dev keeps working without needing that env var.
+const allowedOrigins = ["http://localhost:5173"];
+if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
 
 const app = express();
-app.use(cors());
+// Only our own frontend may call the sign-in routes from a browser
+app.use(cors({ origin: allowedOrigins }));
+app.use(express.json());
+app.use('/api/auth', authRoutes);
 
 // Reads MONGODB_URI from .env and connects to your Atlas cluster
 mongoose
@@ -23,11 +41,6 @@ mongoose
 const server = http.createServer(app);
 
 // Set up Socket.io to allow real-time connections from your React frontend.
-// FRONTEND_URL is set in Render's dashboard once the frontend is deployed; localhost stays
-// allowed too so local dev keeps working without needing that env var.
-const allowedOrigins = ["http://localhost:5173"];
-if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
-
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
@@ -41,63 +54,147 @@ const io = new Server(server, {
   },
 });
 
+// Every live connection must carry a valid sign-in ticket (JWT). Without one it's refused
+// here, before any board event can run. The `data.reason` tells the browser this was a
+// sign-in problem (go back to the sign-in screen), not just the server being unreachable
+io.use((socket, next) => {
+  try {
+    socket.data.user = readToken(socket.handshake.auth?.token);
+    next();
+  } catch {
+    const refused = new Error("Please sign in again");
+    refused.data = { reason: "auth" };
+    next(refused);
+  }
+});
+
+// A board name as plain text, at most 40 characters — String(...) also blocks the
+// NoSQL-injection trick described in routes/auth.js
+const cleanBoardName = (value) => String(value ?? "").trim().slice(0, 40);
+
+// What the boards screen needs to know about each board
+const boardSummary = (board) => ({ name: board.boardId, updatedAt: board.updatedAt });
+
 // Listen for users connecting to the whiteboard
 io.on("connection", (socket) => {
-  console.log(`A user connected with ID: ${socket.id}`);
+  const userId = socket.data.user.id;
+  console.log(`${socket.data.user.username} connected (${socket.id})`);
 
-  // A recovered reconnect already has its previous board's room (and socket.data, which
-  // holds boardId) restored automatically by Socket.IO's connection state recovery — only
-  // a genuinely fresh connection needs to be placed on the default board and handed its
-  // already-drawn shapes, so joining late doesn't mean landing on a blank canvas
-  if (!socket.recovered) {
-    socket.data.boardId = DEFAULT_BOARD_ID;
-    socket.join(DEFAULT_BOARD_ID);
-    Board.findOne({ boardId: DEFAULT_BOARD_ID })
-      .then((board) => {
-        socket.emit("board:init", { boardId: DEFAULT_BOARD_ID, shapes: board ? board.shapes : [] });
-      })
-      .catch((err) => console.error("board:init lookup failed:", err.message));
-  }
+  // Moves this connection into a board's room, so it gets that board's live updates
+  const enterBoard = (board) => {
+    if (socket.data.boardId) socket.leave(socket.data.boardId);
+    socket.data.boardId = board.boardId;
+    socket.join(board.boardId);
+  };
 
   // Every shape lifecycle event (create, move/resize, undo-delete) only reaches other
   // users on the SAME board — everyone's grouped into a Socket.IO room named after the
-  // board they're currently on
+  // board they're currently on. Nothing is passed on before a board has been opened
   ["shape:add", "shape:update", "shape:delete"].forEach((event) => {
     socket.on(event, (payload) => {
+      if (!socket.data.boardId) return;
       socket.to(socket.data.boardId).emit(event, payload);
     });
   });
 
-  // A user typed a board name and asked to switch to it — creating it if it doesn't exist
-  // yet. Leaves whatever board they were on, joins the new one, and hands back its saved
-  // shapes so switching feels like actually opening that board, not a blank canvas
-  socket.on("board:join", async (boardId, callback) => {
+  // The boards screen: boards this user owns (up to 4) and boards they joined with a password
+  socket.on("board:list", async (callback) => {
     try {
-      const id = String(boardId || "").trim();
-      if (!id) {
-        callback({ success: false, error: "Board name can't be empty" });
-        return;
-      }
-      const board = await Board.findOne({ boardId: id });
-      socket.leave(socket.data.boardId);
-      socket.data.boardId = id;
-      socket.join(id);
-      callback({ success: true, boardId: id, shapes: board ? board.shapes : [] });
+      const [mine, shared] = await Promise.all([
+        Board.find({ owner: userId }).select("boardId updatedAt").sort({ updatedAt: -1 }),
+        Board.find({ members: userId }).select("boardId updatedAt").sort({ updatedAt: -1 }),
+      ]);
+      callback({ success: true, mine: mine.map(boardSummary), shared: shared.map(boardSummary), limit: MAX_OWNED_BOARDS });
     } catch (err) {
-      callback({ success: false, error: err.message });
+      console.error("board:list failed:", err.message);
+      callback({ success: false, error: "Could not load your boards" });
     }
   });
 
-  // A user clicked Save — write the current board to MongoDB and tell them if it worked
-  socket.on("board:save", async (shapes, callback) => {
+  // Create a board with a password. The name must be free, and nobody can own more than 4
+  socket.on("board:create", async ({ name, password } = {}, callback) => {
     try {
-      await Board.findOneAndUpdate(
-        { boardId: socket.data.boardId },
-        { shapes },
-        { upsert: true }
-      );
+      const boardId = cleanBoardName(name);
+      const boardPassword = String(password ?? "");
+      if (!boardId) return callback({ success: false, error: "Give the board a name" });
+      if (boardPassword.length < MIN_BOARD_PASSWORD_LENGTH) {
+        return callback({ success: false, error: `The board password needs at least ${MIN_BOARD_PASSWORD_LENGTH} characters` });
+      }
+      if ((await Board.countDocuments({ owner: userId })) >= MAX_OWNED_BOARDS) {
+        return callback({ success: false, error: `You already have ${MAX_OWNED_BOARDS} boards — delete one first` });
+      }
+      if (await Board.exists({ boardId })) return callback({ success: false, error: "That board name is taken" });
+
+      const board = await Board.create({
+        boardId,
+        owner: userId,
+        members: [],
+        passwordHash: await bcrypt.hash(boardPassword, BOARD_HASH_ROUNDS),
+      });
+      enterBoard(board);
+      callback({ success: true, boardId, shapes: [] });
+    } catch (err) {
+      // 11000 = MongoDB's "duplicate key": someone else took the name at the same moment
+      if (err.code === 11000) return callback({ success: false, error: "That board name is taken" });
+      console.error("board:create failed:", err.message);
+      callback({ success: false, error: "Could not create the board" });
+    }
+  });
+
+  // Open a board. Its owner and members go straight in; anyone else needs the board's
+  // password once, then they're added as a member so it appears on their boards list
+  socket.on("board:join", async ({ name, password } = {}, callback) => {
+    try {
+      const board = await Board.findOne({ boardId: cleanBoardName(name) });
+      if (!board) return callback({ success: false, error: "No board with that name" });
+
+      const isOwner = board.owner.equals(userId);
+      const isMember = board.members.some((member) => member.equals(userId));
+      if (!isOwner && !isMember) {
+        if (!(await bcrypt.compare(String(password ?? ""), board.passwordHash))) {
+          return callback({ success: false, error: "Wrong board password" });
+        }
+        // $addToSet adds them only if they aren't on the list already
+        await Board.updateOne({ _id: board._id }, { $addToSet: { members: userId } });
+      }
+      enterBoard(board);
+      callback({ success: true, boardId: board.boardId, shapes: board.shapes });
+    } catch (err) {
+      console.error("board:join failed:", err.message);
+      callback({ success: false, error: "Could not open the board" });
+    }
+  });
+
+  // Back to the boards screen: stop receiving this board's live updates
+  socket.on("board:leave", () => {
+    if (socket.data.boardId) socket.leave(socket.data.boardId);
+    socket.data.boardId = null;
+  });
+
+  // Delete a board — only its owner can, which frees one of their 4 places. Anyone still
+  // on it is told, so their screen goes back to the boards list
+  socket.on("board:delete", async ({ name } = {}, callback) => {
+    try {
+      const boardId = cleanBoardName(name);
+      const result = await Board.deleteOne({ boardId, owner: userId });
+      if (result.deletedCount === 0) return callback({ success: false, error: "Only the board's owner can delete it" });
+      io.to(boardId).emit("board:deleted");
       callback({ success: true });
     } catch (err) {
+      console.error("board:delete failed:", err.message);
+      callback({ success: false, error: "Could not delete the board" });
+    }
+  });
+
+  // Save the open board to MongoDB (the Save button, and auto-save)
+  socket.on("board:save", async (shapes, callback) => {
+    try {
+      if (!socket.data.boardId) return callback({ success: false, error: "No board is open" });
+      if (!Array.isArray(shapes)) return callback({ success: false, error: "Nothing to save" });
+      await Board.updateOne({ boardId: socket.data.boardId }, { shapes });
+      callback({ success: true });
+    } catch (err) {
+      console.error("board:save failed:", err.message);
       callback({ success: false, error: err.message });
     }
   });
@@ -106,25 +203,26 @@ io.on("connection", (socket) => {
   // else on the same board too so the whole room shows the same loaded board
   socket.on("board:load", async (callback) => {
     try {
+      if (!socket.data.boardId) return callback({ success: false, error: "No board is open" });
       const board = await Board.findOne({ boardId: socket.data.boardId });
       const shapes = board ? board.shapes : [];
       callback({ success: true, shapes });
       socket.to(socket.data.boardId).emit("board:sync", shapes);
     } catch (err) {
+      console.error("board:load failed:", err.message);
       callback({ success: false, error: err.message });
     }
   });
 
-  // A user typed a prompt and asked the AI to generate a diagram. The new shapes get
-  // broadcast to everyone else on the same board exactly like hand-drawn ones — same
-  // "shape:add" event — and handed back to the requester directly so their own canvas
-  // picks them up too
+  // A user typed a prompt and asked the AI to generate a diagram. The shapes go back only
+  // to the requester, whose browser moves them into empty space on the board and then
+  // shares them through the normal undo-tracked add flow — the same way Convert works
   socket.on("board:generate", async (prompt, callback) => {
     try {
       const shapes = await generateDiagram(prompt);
-      shapes.forEach((shape) => socket.to(socket.data.boardId).emit("shape:add", shape));
       callback({ success: true, shapes });
     } catch (err) {
+      console.error("board:generate failed:", err.message);
       callback({ success: false, error: err.message });
     }
   });
@@ -138,6 +236,7 @@ io.on("connection", (socket) => {
       const shapes = await convertSketch(payload);
       callback({ success: true, shapes });
     } catch (err) {
+      console.error("board:convertSketch failed:", err.message);
       callback({ success: false, error: err.message });
     }
   });
@@ -149,6 +248,7 @@ io.on("connection", (socket) => {
       const explanation = await explainSelection(payload);
       callback({ success: true, explanation });
     } catch (err) {
+      console.error("board:explainSelection failed:", err.message);
       callback({ success: false, error: err.message });
     }
   });
